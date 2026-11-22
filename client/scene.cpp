@@ -25,6 +25,7 @@
 #include "utils/i18n.h"
 #include "utils/overloaded.h"
 #include "utils/ranges.h"
+#include <cstdlib>
 #include <cstring>
 #include <entt/core/fwd.hpp>
 #include <magic_enum.hpp>
@@ -159,88 +160,98 @@ void scene::render_world(
         bool render_debug_draws)
 {
 	assert(views.size() <= layer::max_views);
-	beman::inplace_vector::inplace_vector<scene_renderer::frame_info, layer::max_views> frames;
 	beman::inplace_vector::inplace_vector<XrCompositionLayerProjectionView, layer::max_views> composition_layer_color;
 	beman::inplace_vector::inplace_vector<XrCompositionLayerDepthInfoKHR, layer::max_views> composition_layer_depth;
 
-	auto [color_swapchain, color_image] = [&]() -> std::tuple<XrSwapchain, vk::Image> {
-		xr::swapchain & color_swapchain = get_swapchain(swapchain_format, width, height, 1, views.size());
-
-		int color_image_index = color_swapchain.acquire();
-		vk::Image color_image = color_swapchain.image(color_image_index);
-		color_swapchain.wait();
-		return {color_swapchain, color_image};
-	}();
-
-	auto [depth_swapchain, depth_image] = [&]() -> std::pair<XrSwapchain, vk::Image> {
-		if (keep_depth_buffer)
-		{
-			xr::swapchain & depth_swapchain = get_swapchain(depth_format, width, height, 1, views.size());
-
-			int depth_image_index = depth_swapchain.acquire();
-			vk::Image depth_image = depth_swapchain.image(depth_image_index);
-			depth_swapchain.wait();
-			return {depth_swapchain, depth_image};
-		}
-		else
-			return {};
-	}();
-
-	for (auto && [index, view]: utils::enumerate(views))
+	// Process-only diagnostic: render local-scene eyes separately, never streamed images.
+	// Keep the two OpenXR projection views together in one layer, in their original order.
+	const char * separate_scene_eyes_env = std::getenv("WIVRN_SEPARATE_SCENE_EYES");
+	const bool separate_scene_eyes = views.size() == 2 and separate_scene_eyes_env and std::strcmp(separate_scene_eyes_env, "1") == 0;
+	for (size_t eye = 0; eye < (separate_scene_eyes ? views.size() : 1); ++eye)
 	{
-		frames.push_back({
-		        .projection = projection_matrix(view.fov, constants::lobby::near_plane),
-		        .view = view_matrix(view.pose),
-		});
+		std::span<XrView> render_views = separate_scene_eyes ? views.subspan(eye, 1) : views;
+		beman::inplace_vector::inplace_vector<scene_renderer::frame_info, layer::max_views> frames;
 
-		composition_layer_color.push_back({
-		        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
-		        .pose = view.pose,
-		        .fov = view.fov,
-		        .subImage = {
-		                .swapchain = color_swapchain,
-		                .imageRect = {
-		                        .offset = {0, 0},
-		                        .extent = {(int)width, (int)height},
-		                },
-		                .imageArrayIndex = (uint32_t)index,
-		        },
-		});
+		// Copy handles before another get_swapchain call can grow the swapchain vector.
+		auto [color_swapchain, color_image] = [&]() -> std::tuple<XrSwapchain, vk::Image> {
+			xr::swapchain & color_swapchain = get_swapchain(swapchain_format, width, height, 1, render_views.size());
 
-		if (keep_depth_buffer)
+			int color_image_index = color_swapchain.acquire();
+			vk::Image color_image = color_swapchain.image(color_image_index);
+			color_swapchain.wait();
+			return {color_swapchain, color_image};
+		}();
+
+		auto [depth_swapchain, depth_image] = [&]() -> std::pair<XrSwapchain, vk::Image> {
+			if (keep_depth_buffer)
+			{
+				xr::swapchain & depth_swapchain = get_swapchain(depth_format, width, height, 1, render_views.size());
+
+				int depth_image_index = depth_swapchain.acquire();
+				vk::Image depth_image = depth_swapchain.image(depth_image_index);
+				depth_swapchain.wait();
+				return {depth_swapchain, depth_image};
+			}
+			else
+				return {};
+		}();
+
+		for (auto && [index, view]: utils::enumerate(render_views))
 		{
-			composition_layer_depth.push_back({
-			        .type = XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR,
+			frames.push_back({
+			        .projection = projection_matrix(view.fov, constants::lobby::near_plane),
+			        .view = view_matrix(view.pose),
+			});
+
+			composition_layer_color.push_back({
+			        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
+			        .pose = view.pose,
+			        .fov = view.fov,
 			        .subImage = {
-			                .swapchain = depth_swapchain,
+			                .swapchain = color_swapchain,
 			                .imageRect = {
 			                        .offset = {0, 0},
 			                        .extent = {(int)width, (int)height},
 			                },
 			                .imageArrayIndex = (uint32_t)index,
 			        },
-			        .minDepth = 0,
-			        .maxDepth = 1,
-			        .nearZ = std::bit_cast<float>(0x7f800000), // infinity
-			        .farZ = constants::lobby::near_plane,
 			});
-			static_assert(std::numeric_limits<float>::is_iec559);
+
+			if (keep_depth_buffer)
+			{
+				composition_layer_depth.push_back({
+				        .type = XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR,
+				        .subImage = {
+				                .swapchain = depth_swapchain,
+				                .imageRect = {
+				                        .offset = {0, 0},
+				                        .extent = {(int)width, (int)height},
+				                },
+				                .imageArrayIndex = (uint32_t)index,
+				        },
+				        .minDepth = 0,
+				        .maxDepth = 1,
+				        .nearZ = std::bit_cast<float>(0x7f800000), // infinity
+				        .farZ = constants::lobby::near_plane,
+				});
+				static_assert(std::numeric_limits<float>::is_iec559);
+			}
 		}
+
+		// TODO: compute transforms only once
+
+		renderer->render(
+		        world,
+		        {clear_color.r, clear_color.g, clear_color.b, clear_color.a},
+		        layer_mask,
+		        vk::Extent2D{width, height},
+		        swapchain_format,
+		        depth_format,
+		        color_image,
+		        depth_image,
+		        frames,
+		        render_debug_draws);
 	}
-
-	// TODO: compute transforms only once
-
-	renderer->render(
-	        world,
-	        {clear_color.r, clear_color.g, clear_color.b, clear_color.a},
-	        layer_mask,
-	        vk::Extent2D{width, height},
-	        swapchain_format,
-	        depth_format,
-	        color_image,
-	        depth_image,
-	        frames,
-	        render_debug_draws);
 
 	add_projection_layer(
 	        XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
