@@ -91,6 +91,7 @@ public:
 	std::underlying_type_t<wivrn::from_headset::body_part_mask> body_part_mask = ~0;
 
 	bool enable_stream_gui = true;
+	bool gaze_overlay_enabled = false;
 
 	// application launcher: list vs grid, and grid icon size, 0 small 1 medium 2 large
 	bool app_list_view = false;

@@ -1841,17 +1841,19 @@ void application::loop()
 	}
 }
 
-std::optional<XrQuaternionf> application::locate_gaze(XrTime time)
+std::optional<XrQuaternionf> application::locate_gaze(XrTime time, XrSpaceLocationFlags required_flags)
 {
+	const XrSpace gaze_space = spaces[size_t(xr::spaces::eye_gaze)];
+	if (gaze_space == XR_NULL_HANDLE)
+		return std::nullopt;
+
 	XrSpaceLocation res{
 	        .type = XR_TYPE_SPACE_LOCATION,
 	};
 	if (get_hmd_traits().view_locate)
 	{
-		xrLocateSpace(spaces[size_t(xr::spaces::eye_gaze)],
-		              spaces[size_t(xr::spaces::view)],
-		              time,
-		              &res);
+		if (XR_FAILED(xrLocateSpace(gaze_space, spaces[size_t(xr::spaces::view)], time, &res)))
+			return std::nullopt;
 	}
 	else
 	{
@@ -1864,11 +1866,11 @@ std::optional<XrQuaternionf> application::locate_gaze(XrTime time)
 		                            &tmp);
 		if (XR_FAILED(xr_res))
 			return std::nullopt;
-		xr_res = xrLocateSpace(spaces[size_t(xr::spaces::eye_gaze)],
-		                       spaces[size_t(xr::spaces::world)],
-		                       time,
-		                       &res);
+		xr_res = xrLocateSpace(gaze_space, spaces[size_t(xr::spaces::world)], time, &res);
 		if (XR_FAILED(xr_res))
+			return std::nullopt;
+		res.locationFlags &= tmp.locationFlags;
+		if ((res.locationFlags & required_flags) != required_flags)
 			return std::nullopt;
 
 		glm::quat target_quat(
@@ -1887,9 +1889,8 @@ std::optional<XrQuaternionf> application::locate_gaze(XrTime time)
 		        .y = target_quat.y,
 		        .z = target_quat.z,
 		        .w = target_quat.w};
-		res.locationFlags &= tmp.locationFlags;
 	}
-	if (res.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)
+	if ((res.locationFlags & required_flags) == required_flags)
 		return res.pose.orientation;
 	return std::nullopt;
 }

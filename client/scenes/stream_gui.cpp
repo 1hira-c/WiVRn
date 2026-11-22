@@ -440,7 +440,7 @@ void scenes::stream::gui_settings(float)
 			wivrn::gui::settings_devices(ctx);
 			break;
 		case settings_page::tracking:
-			if (wivrn::gui::settings_tracking(ctx))
+			if (wivrn::gui::settings_tracking(ctx, gaze_overlay_failed))
 				send_settings_changed_packet(session, network_session.get(), ctx.config);
 			break;
 		case settings_page::system:

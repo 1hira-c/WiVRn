@@ -594,7 +594,7 @@ void settings_devices(const settings_context & ctx)
 		ui::chip(_("The server does not allow forwarded input devices"), ui::chip_style::warning);
 }
 
-bool settings_tracking(const settings_context & ctx)
+bool settings_tracking(const settings_context & ctx, bool gaze_overlay_failed)
 {
 	auto & config = ctx.config;
 	auto & default_config = ctx.default_config;
@@ -644,6 +644,19 @@ bool settings_tracking(const settings_context & ctx)
 		        .disabled_tooltip = disconnect_tip,
 		});
 	};
+
+	if (application::get_eye_gaze_supported())
+		list.push_back({
+		        .id = "##gaze_overlay",
+		        .label = _C("setting name", "OpenXR gaze ring"),
+		        .description = gaze_overlay_failed
+		                               ? _("Could not create the gaze ring. See the WiVRn log and toggle it off and back on to retry.")
+		                               : _("Show a ring in the tracked gaze direction while streaming."),
+		        .ui = ui_kind::toggle,
+		        .get_bool = [&config] { return config.gaze_overlay_enabled; },
+		        .set_bool = [&config](bool enabled) { config.gaze_overlay_enabled = enabled; config.save(); },
+		        .default_bool = default_config.gaze_overlay_enabled,
+		});
 
 	if (ctx.system.hand_tracking_supported())
 		feature_toggle("##hand", _C("setting name", "Hand tracking"), _("Track your hands for input when controllers are down."), feature::hand_tracking);

@@ -39,6 +39,7 @@
 #include "utils/i18n.h"
 #include "utils/named_thread.h"
 #include "utils/ranges.h"
+#include "vk/allocation.h"
 #include "wivrn_packets.h"
 #include <algorithm>
 #include <cmath>
@@ -1195,6 +1196,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		accumulate_metrics(frame_state.predictedDisplayTime, current_blit_handles, timestamps);
 
 		draw_gui(frame_state.predictedDisplayTime, frame_state.predictedDisplayPeriod);
+		if (not application::get_config().gaze_overlay_enabled)
+			gaze_overlay_failed = false;
+		else if (not gaze_overlay_failed and application::get_eye_gaze_supported())
+			draw_gaze_overlay(frame_state.predictedDisplayTime);
 
 		try
 		{
@@ -1291,6 +1296,137 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	}
 
 	query_pool_filled = true;
+}
+
+void scenes::stream::setup_gaze_overlay()
+{
+	constexpr int texture_size = 64;
+	using pixel = std::array<uint8_t, 4>;
+	const auto formats = session.get_swapchain_formats();
+	const auto format = std::ranges::find_if(formats, [](vk::Format value) {
+		return value == vk::Format::eR8G8B8A8Srgb or value == vk::Format::eB8G8R8A8Srgb or
+		       value == vk::Format::eR8G8B8A8Unorm or value == vk::Format::eB8G8R8A8Unorm;
+	});
+	if (format == formats.end())
+		throw std::runtime_error("OpenXR gaze overlay needs an 8-bit swapchain format with alpha");
+	gaze_overlay_layer_limit = system.properties().graphicsProperties.maxLayerCount;
+
+	buffer_allocation staging(
+	        device,
+	        vk::BufferCreateInfo{
+	                .size = texture_size * texture_size * sizeof(pixel),
+	                .usage = vk::BufferUsageFlagBits::eTransferSrc,
+	        },
+	        VmaAllocationCreateInfo{
+	                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+	                .usage = VMA_MEMORY_USAGE_AUTO,
+	                .requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+	        });
+	auto * pixels = staging.data<pixel>();
+	for (int y = 0; y < texture_size; ++y)
+	{
+		for (int x = 0; x < texture_size; ++x)
+		{
+			const float radius = std::hypot(x + 0.5f - texture_size / 2, y + 0.5f - texture_size / 2);
+			const float edge = std::abs(radius - 22.f);
+			// Identical in RGBA and BGRA. The dark outline keeps it visible on bright surfaces.
+			pixels[y * texture_size + x] = edge <= 1.3f ? pixel{80, 255, 80, 255}
+			                              : edge <= 3.f ? pixel{0, 0, 0, 255}
+			                                            : pixel{0, 0, 0, 0};
+		}
+	}
+	staging.unmap();
+
+	// Upload once; OpenXR composites the most recently released image on each frame.
+	xr::swapchain image(instance, session, device, *format, texture_size, texture_size, 1, 1, false, true);
+	const int index = image.acquire();
+	image.wait();
+	auto commands = device.allocateCommandBuffers({
+	        .commandPool = *commandpool,
+	        .level = vk::CommandBufferLevel::ePrimary,
+	        .commandBufferCount = 1,
+	});
+	auto & cmd = commands.front();
+	auto uploaded = device.createFence({});
+	cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+	vk::ImageMemoryBarrier barrier{
+	        .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+	        .oldLayout = vk::ImageLayout::eUndefined,
+	        .newLayout = vk::ImageLayout::eTransferDstOptimal,
+	        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	        .image = image.image(index),
+	        .subresourceRange = {
+	                .aspectMask = vk::ImageAspectFlagBits::eColor,
+	                .levelCount = 1,
+	                .layerCount = 1,
+	        },
+	};
+	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, barrier);
+	cmd.copyBufferToImage(staging, image.image(index), vk::ImageLayout::eTransferDstOptimal, vk::BufferImageCopy{
+	        .imageSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor, .layerCount = 1},
+	        .imageExtent = {texture_size, texture_size, 1},
+	});
+	barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
+	barrier.oldLayout = vk::ImageLayout::eTransferDstOptimal;
+	barrier.newLayout = vk::ImageLayout::eColorAttachmentOptimal;
+	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands, {}, {}, {}, barrier);
+	cmd.end();
+
+	vk::SubmitInfo submit;
+	submit.setCommandBuffers(*cmd);
+	queue.lock()->submit(submit, *uploaded);
+	if (device.waitForFences(*uploaded, VK_TRUE, UINT64_MAX) != vk::Result::eSuccess)
+		throw std::runtime_error("Vulkan fence timeout uploading the OpenXR gaze overlay");
+	image.release();
+	gaze_overlay_swapchain = std::move(image);
+	spdlog::info("OpenXR gaze ring texture ready");
+}
+
+void scenes::stream::draw_gaze_overlay(XrTime display_time)
+{
+	if (not gaze_overlay_swapchain)
+	{
+		try
+		{
+			setup_gaze_overlay();
+		}
+		catch (const std::exception & e)
+		{
+			gaze_overlay_failed = true;
+			spdlog::warn("OpenXR gaze overlay: {}", e.what());
+			return;
+		}
+	}
+	if (layers.size() >= gaze_overlay_layer_limit)
+		return;
+
+	const auto gaze = application::instance().locate_gaze(
+	        display_time, XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT);
+	if (not gaze)
+		return;
+	const glm::quat orientation(gaze->w, gaze->x, gaze->y, gaze->z);
+	const float length_squared = glm::dot(orientation, orientation);
+	if (not std::isfinite(length_squared) or std::abs(length_squared - 1.f) > 0.01f)
+		return;
+
+	const glm::quat unit = glm::normalize(orientation);
+	const glm::vec3 direction = unit * glm::vec3(0.f, 0.f, -1.f);
+	if (direction.z >= 0)
+		return;
+
+	// A direction marker at a fixed distance from the VIEW origin.
+	constexpr float distance = 2.f;
+	constexpr float size = 0.08f;
+	const glm::vec3 center = distance * direction;
+	add_quad_layer(
+	        XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+	        application::space(xr::spaces::view),
+	        XR_EYE_VISIBILITY_BOTH,
+	        {.swapchain = gaze_overlay_swapchain, .imageRect = {.extent = gaze_overlay_swapchain.extent()}},
+	        {.orientation = {unit.x, unit.y, unit.z, unit.w}, .position = {center.x, center.y, center.z}},
+	        {size, size});
 }
 
 void scenes::stream::exit()

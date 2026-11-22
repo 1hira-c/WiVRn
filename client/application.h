@@ -278,7 +278,9 @@ public:
 		return std::make_pair(position, orientation);
 	}
 
-	std::optional<XrQuaternionf> locate_gaze(XrTime time);
+	std::optional<XrQuaternionf> locate_gaze(
+	        XrTime time,
+	        XrSpaceLocationFlags required_flags = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT);
 
 	void run();
 

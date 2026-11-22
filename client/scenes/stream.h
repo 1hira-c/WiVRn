@@ -153,6 +153,9 @@ private:
 
 	client_foveation::center foveation_center;
 	xr::swapchain swapchain;
+	bool gaze_overlay_failed = false;
+	uint32_t gaze_overlay_layer_limit = 0;
+	xr::swapchain gaze_overlay_swapchain;
 
 	std::optional<audio> audio_handle;
 
@@ -308,6 +311,8 @@ private:
 	void setup(const to_headset::video_stream_description &);
 	void setup_reprojection_swapchain(uint32_t width, uint32_t height, bool foveation);
 	void ensure_swapchain(bool cropped, uint32_t width, uint32_t height);
+	void setup_gaze_overlay();
+	void draw_gaze_overlay(XrTime display_time);
 
 	vk::raii::QueryPool query_pool = nullptr;
 	bool query_pool_filled = false;
