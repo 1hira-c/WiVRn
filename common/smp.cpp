@@ -218,7 +218,7 @@ bignum smp::hash(int version, const bignum & a, const bignum * b)
 		throw_openssl_error();
 
 	std::string output;
-	output.resize(EVP_MD_CTX_size(ctx.get()));
+	output.resize(EVP_MD_size(EVP_sha256()));
 	if (EVP_DigestFinal(ctx.get(), reinterpret_cast<unsigned char *>(output.data()), nullptr) == 0)
 		throw_openssl_error();
 
